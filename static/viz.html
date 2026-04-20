@@ -417,7 +417,6 @@
       });
       row.querySelector('.del').addEventListener('click', async (ev) => {
         ev.stopPropagation();
-        if (!confirm(`Delete episode #${e.episode_index} (${e.length} frames)?\nRemaining episodes will be re-indexed. This is irreversible.`)) return;
         row.classList.add('deleting');
         try {
           const r = await fetch('/api/viz/delete_episodes', {

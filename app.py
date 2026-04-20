@@ -820,11 +820,28 @@ class PushRequest(BaseModel):
 
 @app.post("/api/viz/push_to_hub")
 def viz_push_to_hub(req: PushRequest):
-    """Push the local dataset back up to the same HuggingFace repo."""
+    """Push the local dataset up to HuggingFace as a mirror.
+
+    Uses delete_patterns=["*"] so files that exist on the remote but no
+    longer exist locally (e.g. from episode deletions that shrank the
+    file count) are removed — lerobot's own push_to_hub only adds/overwrites,
+    so deletions weren't propagating.
+    """
+    from huggingface_hub import HfApi
     root = _viz_resolve_repo(req.repo_id)
     try:
         ds = LeRobotDataset(req.repo_id, root=root)
-        ds.push_to_hub()
+        api = HfApi()
+        api.create_repo(repo_id=req.repo_id, repo_type="dataset", exist_ok=True)
+        api.upload_folder(
+            repo_id=req.repo_id,
+            folder_path=str(root),
+            repo_type="dataset",
+            ignore_patterns=["images/"],
+            delete_patterns=["*"],  # mirror: wipe remote files not present locally
+            commit_message=f"Sync from lerobot-webapp ({ds.meta.total_episodes} eps, "
+                           f"{ds.meta.total_frames} frames)",
+        )
     except Exception as exc:
         log.exception("push_to_hub failed")
         raise HTTPException(500, f"push failed: {exc}")
