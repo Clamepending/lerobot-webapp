@@ -814,6 +814,28 @@ class DeleteEpisodesRequest(BaseModel):
     episode_indices: list[int]
 
 
+class PushRequest(BaseModel):
+    repo_id: str
+
+
+@app.post("/api/viz/push_to_hub")
+def viz_push_to_hub(req: PushRequest):
+    """Push the local dataset back up to the same HuggingFace repo."""
+    root = _viz_resolve_repo(req.repo_id)
+    try:
+        ds = LeRobotDataset(req.repo_id, root=root)
+        ds.push_to_hub()
+    except Exception as exc:
+        log.exception("push_to_hub failed")
+        raise HTTPException(500, f"push failed: {exc}")
+    return JSONResponse({
+        "ok": True,
+        "hub_url": f"https://huggingface.co/datasets/{req.repo_id}",
+        "episodes": ds.meta.total_episodes,
+        "frames": ds.meta.total_frames,
+    })
+
+
 @app.post("/api/viz/delete_episodes")
 def viz_delete_episodes(req: DeleteEpisodesRequest):
     """Delete episodes from a dataset in place (atomic swap with a temp copy).
