@@ -1,0 +1,641 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>LeRobot Dataset Viz</title>
+<style>
+  :root {
+    --bg: #0a0a0b;
+    --panel: #111113;
+    --panel-hi: #16161a;
+    --border: #26262d;
+    --text: #ececef;
+    --muted: #8a8a94;
+    --muted-2: #5a5a64;
+    --accent: #8fb3ff;
+    --red: #ff4d4f;
+    --amber: #f5a524;
+    --green: #3ecf8e;
+    --blue: #3b82f6;
+    --purple: #a78bfa;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    height: 100%;
+  }
+  body { display: flex; flex-direction: column; min-height: 100vh; }
+  .topbar {
+    display: flex; align-items: center; gap: 16px;
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  .logo { font-weight: 600; letter-spacing: -0.01em; }
+  .logo .accent { color: var(--accent); }
+  .repo {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    color: var(--muted); font-size: 13px;
+  }
+  .spacer { flex: 1; }
+  .topbar a { color: var(--accent); text-decoration: none; font-size: 13px; }
+  .topbar a:hover { text-decoration: underline; }
+
+  main {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 260px minmax(0, 1fr);
+    min-height: 0;
+  }
+  .sidebar {
+    border-right: 1px solid var(--border);
+    background: var(--panel);
+    overflow-y: auto;
+    padding: 14px 0;
+  }
+  .sidebar h3 {
+    margin: 0 20px 10px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .ep-list { display: flex; flex-direction: column; }
+  .ep-item {
+    display: grid;
+    grid-template-columns: 36px 1fr auto;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 20px;
+    cursor: pointer;
+    border-left: 2px solid transparent;
+    transition: background 100ms;
+  }
+  .ep-item:hover { background: var(--panel-hi); }
+  .ep-item.active {
+    background: var(--panel-hi);
+    border-left-color: var(--accent);
+  }
+  .ep-item .num {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12px; color: var(--muted);
+  }
+  .ep-item.active .num { color: var(--accent); }
+  .ep-item .task {
+    font-size: 13px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .ep-item .len {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px; color: var(--muted-2);
+  }
+
+  .stage {
+    display: flex; flex-direction: column;
+    padding: 20px;
+    gap: 16px;
+    min-width: 0; min-height: 0;
+  }
+  .videos {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    min-height: 0;
+  }
+  .vtile {
+    position: relative;
+    aspect-ratio: 4 / 3;
+    background: #000;
+    border-radius: 14px;
+    border: 1px solid var(--border);
+    overflow: hidden;
+  }
+  .vtile video {
+    width: 100%; height: 100%;
+    object-fit: contain;
+    display: block;
+  }
+  .vlabel {
+    position: absolute; top: 10px; left: 10px;
+    padding: 4px 8px;
+    background: rgba(0,0,0,0.65);
+    backdrop-filter: blur(6px);
+    border-radius: 6px;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .controls {
+    display: grid;
+    grid-template-columns: auto 1fr auto auto auto;
+    align-items: center;
+    gap: 14px;
+  }
+  .play-btn {
+    width: 40px; height: 40px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--accent); color: #0a0a0b;
+    font-family: inherit;
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 14px; font-weight: 700;
+    padding: 0;
+  }
+  .play-btn:hover { filter: brightness(1.08); }
+  .scrubber {
+    width: 100%;
+    -webkit-appearance: none;
+    appearance: none;
+    background: transparent;
+    margin: 0;
+  }
+  .scrubber::-webkit-slider-runnable-track {
+    height: 4px; background: var(--border); border-radius: 999px;
+  }
+  .scrubber::-moz-range-track {
+    height: 4px; background: var(--border); border-radius: 999px;
+  }
+  .scrubber::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 14px; height: 14px; border-radius: 50%;
+    background: var(--accent);
+    margin-top: -5px;
+    cursor: pointer;
+  }
+  .scrubber::-moz-range-thumb {
+    width: 14px; height: 14px; border-radius: 50%;
+    background: var(--accent); border: 0;
+    cursor: pointer;
+  }
+  .timebox {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-variant-numeric: tabular-nums;
+    font-size: 13px; color: var(--muted);
+    min-width: 84px; text-align: right;
+  }
+  .speed-group {
+    display: flex; gap: 4px;
+  }
+  .speed-btn {
+    padding: 4px 8px;
+    font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    border: 1px solid var(--border); border-radius: 6px;
+    background: var(--panel-hi); color: var(--muted);
+    cursor: pointer;
+  }
+  .speed-btn.active { background: var(--accent); color: #0a0a0b; border-color: var(--accent); }
+  .loop-btn {
+    padding: 4px 10px;
+    font-size: 12px;
+    border: 1px solid var(--border); border-radius: 6px;
+    background: var(--panel-hi); color: var(--muted);
+    cursor: pointer;
+  }
+  .loop-btn.on { background: var(--green); color: #0a0a0b; border-color: var(--green); }
+
+  .charts {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 8px;
+  }
+  .chart-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px;
+  }
+  .chart-head {
+    display: flex; justify-content: space-between; align-items: center;
+    margin-bottom: 8px;
+  }
+  .chart-head .title {
+    font-size: 12px; color: var(--muted);
+    letter-spacing: 0.08em; text-transform: uppercase; font-weight: 600;
+  }
+  .chart-legend {
+    display: flex; gap: 10px; font-size: 11px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .chart-legend .swatch {
+    display: inline-block;
+    width: 8px; height: 8px; border-radius: 2px;
+    margin-right: 4px;
+    vertical-align: 1px;
+  }
+  canvas { display: block; width: 100%; height: 120px; }
+  .ep-header {
+    display: flex; justify-content: space-between; align-items: baseline;
+    gap: 16px; flex-wrap: wrap;
+  }
+  .ep-title { font-size: 18px; font-weight: 600; letter-spacing: -0.01em; }
+  .ep-task {
+    font-size: 13px; color: var(--muted); font-style: italic;
+  }
+  .ep-meta {
+    font-size: 12px; color: var(--muted);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+
+  .empty {
+    display: flex; align-items: center; justify-content: center;
+    color: var(--muted-2); font-size: 14px;
+    padding: 60px;
+  }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <div class="logo"><span class="accent">●</span> Dataset Viz</div>
+  <div class="repo" id="repo-label">—</div>
+  <div class="spacer"></div>
+  <a href="/">Recorder →</a>
+  <a id="hf-link" href="#" target="_blank">HuggingFace ↗</a>
+</header>
+
+<main>
+  <aside class="sidebar">
+    <h3 id="ep-list-title">Episodes</h3>
+    <div class="ep-list" id="ep-list"></div>
+  </aside>
+
+  <section class="stage" id="stage">
+    <div class="empty" id="empty">Loading dataset…</div>
+  </section>
+</main>
+
+<template id="stage-tpl">
+  <div class="ep-header">
+    <div>
+      <div class="ep-title" id="ep-title">—</div>
+      <div class="ep-task" id="ep-task">—</div>
+    </div>
+    <div class="ep-meta" id="ep-meta">—</div>
+  </div>
+  <div class="videos" id="videos"></div>
+  <div class="controls">
+    <button class="play-btn" id="play-btn">▶</button>
+    <input class="scrubber" type="range" id="scrubber" min="0" max="1000" value="0" step="1" />
+    <div class="timebox" id="timebox">0.00 / 0.00s</div>
+    <div class="speed-group">
+      <button class="speed-btn" data-speed="0.5">0.5×</button>
+      <button class="speed-btn active" data-speed="1">1×</button>
+      <button class="speed-btn" data-speed="2">2×</button>
+      <button class="speed-btn" data-speed="4">4×</button>
+    </div>
+    <button class="loop-btn" id="loop-btn">Loop</button>
+  </div>
+  <div class="charts" id="charts"></div>
+</template>
+
+<script>
+  // ------- palette for 6-channel joints -------
+  const JOINT_COLORS = ['#ff4d4f','#f5a524','#3ecf8e','#3b82f6','#a78bfa','#ec4899'];
+
+  const qs = (sel, root = document) => root.querySelector(sel);
+  const qsa = (sel, root = document) => [...root.querySelectorAll(sel)];
+
+  const params = new URLSearchParams(location.search);
+  const REPO_ID = params.get('repo_id') || 'clamepending/pingu_to_coaster_420';
+  qs('#repo-label').textContent = REPO_ID;
+  qs('#hf-link').href = `https://huggingface.co/datasets/${REPO_ID}`;
+
+  const stage = qs('#stage');
+  const epList = qs('#ep-list');
+  const epListTitle = qs('#ep-list-title');
+
+  let datasetInfo = null;
+  let currentEpisode = null;
+  let videos = [];  // [{camera, el, fromTs, toTs}]
+  let seriesCanvases = {};  // { action: {canvas, ctx}, state: {...} }
+  let charts = {};
+  let playing = false;
+  let playbackSpeed = 1;
+  let loopOn = false;
+  let rafId = null;
+
+  async function loadInfo() {
+    const r = await fetch(`/api/viz/info?repo_id=${encodeURIComponent(REPO_ID)}`);
+    if (!r.ok) throw new Error(await r.text());
+    datasetInfo = await r.json();
+    epListTitle.textContent = `Episodes · ${datasetInfo.total_episodes}`;
+    renderEpisodeList(datasetInfo.episodes);
+    if (datasetInfo.episodes.length) loadEpisode(datasetInfo.episodes[0].episode_index);
+  }
+
+  function renderEpisodeList(eps) {
+    epList.innerHTML = '';
+    for (const e of eps) {
+      const row = document.createElement('div');
+      row.className = 'ep-item';
+      row.dataset.ep = e.episode_index;
+      row.innerHTML = `
+        <span class="num">#${String(e.episode_index).padStart(2,'0')}</span>
+        <span class="task">${e.task}</span>
+        <span class="len">${e.length}</span>
+      `;
+      row.addEventListener('click', () => loadEpisode(e.episode_index));
+      epList.appendChild(row);
+    }
+  }
+
+  async function loadEpisode(idx) {
+    qsa('.ep-item').forEach(el => el.classList.toggle('active', Number(el.dataset.ep) === idx));
+    stopPlayback();
+    stage.innerHTML = '';
+    const tpl = qs('#stage-tpl').content.cloneNode(true);
+    stage.appendChild(tpl);
+
+    const r = await fetch(`/api/viz/episode/${idx}?repo_id=${encodeURIComponent(REPO_ID)}`);
+    if (!r.ok) { qs('#empty', stage).textContent = 'Failed to load episode'; return; }
+    const ep = await r.json();
+    currentEpisode = ep;
+
+    qs('#ep-title').textContent = `Episode #${String(ep.episode_index).padStart(2,'0')}`;
+    qs('#ep-task').textContent = ep.task;
+    const dur = ep.timestamps.at(-1) - ep.timestamps[0];
+    qs('#ep-meta').textContent = `${ep.length} frames · ${dur.toFixed(2)}s · ${datasetInfo.fps} fps`;
+
+    renderVideos(ep);
+    renderCharts(ep);
+    wireControls(ep);
+    drawChartCursor(0);
+  }
+
+  function renderVideos(ep) {
+    const vidBox = qs('#videos');
+    vidBox.innerHTML = '';
+    videos = [];
+    const cams = Object.keys(ep.videos);
+    // 1 cam → full width; 2+ → side-by-side grid
+    if (cams.length === 1) vidBox.style.gridTemplateColumns = '1fr';
+    else if (cams.length === 2) vidBox.style.gridTemplateColumns = '1fr 1fr';
+    else vidBox.style.gridTemplateColumns = `repeat(${cams.length}, 1fr)`;
+
+    for (const vk of cams) {
+      const shortName = vk.replace('observation.images.', '');
+      const tile = document.createElement('div');
+      tile.className = 'vtile';
+      const label = document.createElement('div');
+      label.className = 'vlabel';
+      label.textContent = shortName;
+      const video = document.createElement('video');
+      video.src = `/api/viz/video/${encodeURIComponent(shortName)}/${ep.episode_index}?repo_id=${encodeURIComponent(REPO_ID)}`;
+      video.muted = true;
+      video.playsInline = true;
+      video.preload = 'auto';
+      video.addEventListener('loadedmetadata', () => {
+        video.currentTime = ep.videos[vk].from_timestamp;
+      });
+      tile.appendChild(label);
+      tile.appendChild(video);
+      vidBox.appendChild(tile);
+      videos.push({
+        camera: shortName,
+        el: video,
+        fromTs: ep.videos[vk].from_timestamp,
+        toTs: ep.videos[vk].to_timestamp,
+      });
+    }
+  }
+
+  function renderCharts(ep) {
+    const chartsEl = qs('#charts');
+    chartsEl.innerHTML = '';
+    charts = {};
+    seriesCanvases = {};
+
+    const chartSpecs = [
+      { id: 'action', title: 'Action (commanded)', data: ep.action, names: datasetInfo.action_names },
+      { id: 'state',  title: 'Observation state', data: ep.observation_state, names: datasetInfo.state_names },
+    ];
+
+    for (const spec of chartSpecs) {
+      const card = document.createElement('div');
+      card.className = 'chart-card';
+      const head = document.createElement('div');
+      head.className = 'chart-head';
+      const title = document.createElement('div');
+      title.className = 'title';
+      title.textContent = spec.title;
+      const legend = document.createElement('div');
+      legend.className = 'chart-legend';
+      for (let i = 0; i < spec.names.length; i++) {
+        const s = document.createElement('span');
+        const sw = document.createElement('span');
+        sw.className = 'swatch';
+        sw.style.background = JOINT_COLORS[i % JOINT_COLORS.length];
+        s.appendChild(sw);
+        s.appendChild(document.createTextNode(spec.names[i].replace('.pos','')));
+        legend.appendChild(s);
+      }
+      head.appendChild(title); head.appendChild(legend);
+      card.appendChild(head);
+
+      const canvas = document.createElement('canvas');
+      canvas.width = 1; canvas.height = 1; // actual dims set in draw
+      card.appendChild(canvas);
+      chartsEl.appendChild(card);
+
+      charts[spec.id] = { canvas, data: spec.data, names: spec.names };
+      drawChart(charts[spec.id]);
+    }
+  }
+
+  function drawChart(chart) {
+    const c = chart.canvas;
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = c.clientWidth || c.parentElement.clientWidth;
+    const cssH = 120;
+    c.width = Math.floor(cssW * dpr);
+    c.height = Math.floor(cssH * dpr);
+    c.style.height = cssH + 'px';
+    const ctx = c.getContext('2d');
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, cssW, cssH);
+
+    const data = chart.data;
+    if (!data.length) return;
+    const n = data.length;
+    const d = data[0].length; // num joints
+
+    // Find global min/max for shared y-axis
+    let mn = Infinity, mx = -Infinity;
+    for (let i = 0; i < n; i++) {
+      const row = data[i];
+      for (let j = 0; j < d; j++) {
+        if (row[j] < mn) mn = row[j];
+        if (row[j] > mx) mx = row[j];
+      }
+    }
+    if (mn === mx) { mn -= 1; mx += 1; }
+    const pad = (mx - mn) * 0.05;
+    mn -= pad; mx += pad;
+
+    // Gridlines
+    ctx.strokeStyle = '#26262d';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let i = 0; i <= 4; i++) {
+      const y = (i / 4) * cssH;
+      ctx.moveTo(0, y); ctx.lineTo(cssW, y);
+    }
+    ctx.stroke();
+
+    // Plot each joint
+    const yScale = (v) => cssH - ((v - mn) / (mx - mn)) * cssH;
+    const xScale = (i) => (i / (n - 1)) * cssW;
+    for (let j = 0; j < d; j++) {
+      ctx.strokeStyle = JOINT_COLORS[j % JOINT_COLORS.length];
+      ctx.lineWidth = 1.25;
+      ctx.beginPath();
+      for (let i = 0; i < n; i++) {
+        const x = xScale(i);
+        const y = yScale(data[i][j]);
+        if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      }
+      ctx.stroke();
+    }
+
+    chart._cached = { cssW, cssH, dpr, mn, mx, n };
+  }
+
+  function drawChartCursor(frameIdx) {
+    for (const id in charts) {
+      const chart = charts[id];
+      if (!chart._cached) continue;
+      const { cssW, cssH, dpr, n } = chart._cached;
+      drawChart(chart); // redraw base
+      const ctx = chart.canvas.getContext('2d');
+      ctx.scale(dpr, dpr); // was reset by redraw? just to be safe, actually drawChart already did setTransform implicit... redraw handles scale
+      const x = (frameIdx / Math.max(1, n - 1)) * cssW;
+      ctx.strokeStyle = '#ececef';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x, 0); ctx.lineTo(x, cssH);
+      ctx.stroke();
+    }
+  }
+
+  function wireControls(ep) {
+    const playBtn = qs('#play-btn');
+    const scrubber = qs('#scrubber');
+    const timebox = qs('#timebox');
+    const loopBtn = qs('#loop-btn');
+
+    scrubber.min = 0;
+    scrubber.max = ep.length - 1;
+    scrubber.value = 0;
+
+    const dur = ep.timestamps.at(-1) - ep.timestamps[0];
+    const setTime = (t /* seconds within episode */) => {
+      const frameIdx = Math.max(0, Math.min(ep.length - 1, Math.round(t * datasetInfo.fps)));
+      scrubber.value = frameIdx;
+      timebox.textContent = `${t.toFixed(2)} / ${dur.toFixed(2)}s`;
+      drawChartCursor(frameIdx);
+      for (const v of videos) {
+        const target = v.fromTs + t;
+        if (Math.abs(v.el.currentTime - target) > 0.05) v.el.currentTime = target;
+      }
+    };
+
+    scrubber.addEventListener('input', () => {
+      const frame = Number(scrubber.value);
+      setTime(frame / datasetInfo.fps);
+      if (playing) stopPlayback();
+    });
+
+    playBtn.addEventListener('click', togglePlayback);
+    loopBtn.addEventListener('click', () => {
+      loopOn = !loopOn;
+      loopBtn.classList.toggle('on', loopOn);
+    });
+
+    qsa('.speed-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        playbackSpeed = parseFloat(btn.dataset.speed);
+        qsa('.speed-btn').forEach(b => b.classList.toggle('active', b === btn));
+        for (const v of videos) v.el.playbackRate = playbackSpeed;
+      });
+    });
+
+    // Play loop — drive off wall clock, sync videos + scrubber + cursor
+    window._setTime = setTime; // used by rAF loop
+    window._episodeDuration = dur;
+  }
+
+  function togglePlayback() {
+    if (playing) stopPlayback();
+    else startPlayback();
+  }
+
+  function startPlayback() {
+    if (!currentEpisode) return;
+    playing = true;
+    qs('#play-btn').textContent = '⏸';
+    for (const v of videos) {
+      v.el.playbackRate = playbackSpeed;
+      v.el.play().catch(()=>{});
+    }
+    const startWall = performance.now();
+    const startEp = (Number(qs('#scrubber').value) / datasetInfo.fps);
+    const tick = () => {
+      if (!playing) return;
+      const elapsed = (performance.now() - startWall) / 1000 * playbackSpeed;
+      let t = startEp + elapsed;
+      if (t >= window._episodeDuration) {
+        if (loopOn) { stopPlayback(); window._setTime(0); startPlayback(); return; }
+        t = window._episodeDuration;
+        window._setTime(t);
+        stopPlayback();
+        return;
+      }
+      window._setTime(t);
+      rafId = requestAnimationFrame(tick);
+    };
+    rafId = requestAnimationFrame(tick);
+  }
+
+  function stopPlayback() {
+    playing = false;
+    qs('#play-btn').textContent = '▶';
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = null;
+    for (const v of videos) v.el.pause();
+  }
+
+  // Keyboard: Space play/pause, ←/→ frame step
+  document.addEventListener('keydown', (e) => {
+    if (e.target.tagName === 'INPUT') return;
+    if (e.key === ' ') { e.preventDefault(); togglePlayback(); }
+    else if (e.key === 'ArrowLeft') {
+      const s = qs('#scrubber'); s.value = Math.max(0, Number(s.value) - 1); s.dispatchEvent(new Event('input'));
+    } else if (e.key === 'ArrowRight') {
+      const s = qs('#scrubber'); s.value = Math.min(Number(s.max), Number(s.value) + 1); s.dispatchEvent(new Event('input'));
+    }
+  });
+
+  // Responsive chart re-render on resize
+  let rzTimer = null;
+  window.addEventListener('resize', () => {
+    clearTimeout(rzTimer);
+    rzTimer = setTimeout(() => {
+      for (const id in charts) drawChart(charts[id]);
+      if (currentEpisode) drawChartCursor(Number(qs('#scrubber').value));
+    }, 150);
+  });
+
+  loadInfo().catch(err => {
+    stage.innerHTML = `<div class="empty">Failed: ${err.message}</div>`;
+  });
+</script>
+</body>
+</html>
