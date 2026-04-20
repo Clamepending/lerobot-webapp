@@ -809,6 +809,72 @@ def viz_episode(episode_index: int, repo_id: str = "clamepending/pingu_to_coaste
         "videos": ep["videos"],
     })
 
+class DeleteEpisodesRequest(BaseModel):
+    repo_id: str
+    episode_indices: list[int]
+
+
+@app.post("/api/viz/delete_episodes")
+def viz_delete_episodes(req: DeleteEpisodesRequest):
+    """Delete episodes from a dataset in place (atomic swap with a temp copy).
+
+    Uses lerobot's delete_episodes which builds a reindexed copy, then we swap
+    the new copy into the original repo path so all subsequent reads see the
+    updated dataset under the same repo_id.
+    """
+    import shutil
+    from lerobot.datasets.dataset_tools import delete_episodes
+    root = _viz_resolve_repo(req.repo_id)
+    if not req.episode_indices:
+        raise HTTPException(400, "no episode_indices provided")
+    ds = LeRobotDataset(req.repo_id, root=root)
+    total = ds.meta.total_episodes
+    invalid = [i for i in req.episode_indices if i < 0 or i >= total]
+    if invalid:
+        raise HTTPException(400, f"invalid episode indices: {invalid}")
+    if len(req.episode_indices) >= total:
+        raise HTTPException(400, "cannot delete all episodes; dataset would be empty")
+
+    tmp_repo = f"{req.repo_id}__tmp_del_{int(time.time())}"
+    tmp_root = HF_LEROBOT_HOME / tmp_repo
+    try:
+        delete_episodes(
+            dataset=ds,
+            episode_indices=sorted(set(req.episode_indices)),
+            output_dir=tmp_root,
+            repo_id=req.repo_id,  # keep original repo_id in the metadata
+        )
+    except Exception as exc:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+        log.exception("delete_episodes failed")
+        raise HTTPException(500, f"delete failed: {exc}")
+
+    # Atomic swap: move original out of the way, move new in, then delete backup.
+    backup = root.with_suffix(root.suffix + f".bak_{int(time.time())}")
+    try:
+        root.rename(backup)
+        tmp_root.rename(root)
+    except Exception as exc:
+        # Try to roll back
+        if backup.exists() and not root.exists():
+            backup.rename(root)
+        shutil.rmtree(tmp_root, ignore_errors=True)
+        raise HTTPException(500, f"swap failed: {exc}")
+    shutil.rmtree(backup, ignore_errors=True)
+
+    # Invalidate cached meta so the next /api/viz/info re-reads from disk.
+    _VIZ_META_CACHE.pop(req.repo_id, None)
+
+    # Re-read new totals for response
+    new_ds = LeRobotDataset(req.repo_id, root=root)
+    return JSONResponse({
+        "ok": True,
+        "deleted": sorted(set(req.episode_indices)),
+        "remaining_episodes": new_ds.meta.total_episodes,
+        "remaining_frames": new_ds.meta.total_frames,
+    })
+
+
 @app.get("/api/viz/video/{camera}/{episode_index}")
 def viz_video(camera: str, episode_index: int, repo_id: str = "clamepending/pingu_to_coaster_420"):
     """Serve the chunk MP4 that contains this episode, with HTTP range support
