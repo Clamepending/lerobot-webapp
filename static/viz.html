@@ -105,19 +105,50 @@
     background: transparent;
     color: var(--muted-2);
     cursor: pointer;
-    display: flex; align-items: center; justify-content: center;
+    display: none;
+    align-items: center; justify-content: center;
     font-size: 13px;
     padding: 0;
-    opacity: 0;
-    transition: opacity 120ms, background 120ms, color 120ms;
+    transition: background 120ms, color 120ms;
   }
-  .ep-item:hover .del { opacity: 1; }
+  body.edit-mode .ep-item .del { display: flex; }
   .ep-item .del:hover {
     background: #1a0607;
     border-color: #3d1214;
     color: var(--red);
   }
   .ep-item.deleting { opacity: 0.4; pointer-events: none; }
+
+  /* Edit-mode chrome */
+  .edit-toggle {
+    padding: 6px 12px;
+    font-size: 13px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel-hi);
+    color: var(--text);
+    cursor: pointer;
+    font-family: inherit;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .edit-toggle:hover { border-color: #383840; }
+  body.edit-mode .edit-toggle {
+    background: var(--red); color: #0a0a0b; border-color: var(--red);
+  }
+  .edit-banner {
+    display: none;
+    background: #1a0607;
+    border-bottom: 1px solid #3d1214;
+    color: var(--red);
+    padding: 10px 20px;
+    font-size: 13px;
+    text-align: center;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    letter-spacing: 0.04em;
+  }
+  body.edit-mode .edit-banner { display: block; }
+  body.edit-mode .ep-item { padding-right: 16px; }
+  body.edit-mode .sidebar { border-right-color: var(--red); }
 
   .stage {
     display: flex; flex-direction: column;
@@ -285,9 +316,15 @@
   <div class="logo"><span class="accent">●</span> Dataset Viz</div>
   <div class="repo" id="repo-label">—</div>
   <div class="spacer"></div>
+  <button class="edit-toggle" id="edit-toggle" title="Toggle edit mode (E)">
+    <span id="edit-toggle-label">Edit</span>
+  </button>
   <a href="/">Recorder →</a>
   <a id="hf-link" href="#" target="_blank">HuggingFace ↗</a>
 </header>
+<div class="edit-banner" id="edit-banner">
+  Edit mode — delete episodes to remove them from the dataset. Changes are irreversible.
+</div>
 
 <main>
   <aside class="sidebar">
@@ -695,6 +732,29 @@
   });
   window.addEventListener('unhandledrejection', (e) => {
     stage.innerHTML = `<div class="empty">Promise rejection: ${e.reason && e.reason.message || e.reason}</div>`;
+  });
+
+  // Edit mode toggle — persists across reloads
+  const editToggle = qs('#edit-toggle');
+  const editLabel = qs('#edit-toggle-label');
+  function setEditMode(on) {
+    document.body.classList.toggle('edit-mode', on);
+    editLabel.textContent = on ? 'Done' : 'Edit';
+    localStorage.setItem('viz-edit-mode', on ? '1' : '0');
+  }
+  editToggle.addEventListener('click', () => {
+    setEditMode(!document.body.classList.contains('edit-mode'));
+  });
+  setEditMode(localStorage.getItem('viz-edit-mode') === '1');
+
+  // `E` toggles edit mode (when not in input/scrubber)
+  const oldKeydownListener = document.onkeydown;
+  document.addEventListener('keydown', (e) => {
+    if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+    if (e.key === 'e' || e.key === 'E') {
+      e.preventDefault();
+      setEditMode(!document.body.classList.contains('edit-mode'));
+    }
   });
 
   loadInfo().catch(err => {
