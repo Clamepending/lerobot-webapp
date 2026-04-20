@@ -713,6 +713,32 @@ def stream(cam: str):
 
 _VIZ_META_CACHE: dict[str, dict] = {}
 
+def _viz_exclude_path(root: Path) -> Path:
+    """Where the webapp stores its soft-delete manifest.
+
+    Sits under meta/ alongside info.json; lerobot ignores unknown files here
+    when loading the dataset, so it's a safe place for webapp-only state.
+    """
+    return root / "meta" / "webapp_excluded.json"
+
+def _viz_load_excluded(root: Path) -> set[int]:
+    p = _viz_exclude_path(root)
+    if not p.exists():
+        return set()
+    try:
+        import json
+        d = json.loads(p.read_text())
+        return set(int(i) for i in d.get("excluded", []))
+    except Exception:
+        log.warning("could not parse %s — treating as empty", p)
+        return set()
+
+def _viz_save_excluded(root: Path, excluded: set[int]):
+    import json
+    p = _viz_exclude_path(root)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"excluded": sorted(excluded)}, indent=2))
+
 def _viz_resolve_repo(repo_id: str) -> Path:
     root = HF_LEROBOT_HOME / repo_id
     if not root.exists():
@@ -771,19 +797,62 @@ def viz_root():
 @app.get("/api/viz/info")
 def viz_info(repo_id: str = "clamepending/pingu_to_coaster_420"):
     meta = _viz_load_meta(repo_id)
+    root = _viz_resolve_repo(repo_id)
+    excluded = _viz_load_excluded(root)
+    kept_frames = sum(e["length"] for e in meta["episodes"] if e["episode_index"] not in excluded)
     return JSONResponse({
         "repo_id": repo_id,
         "fps": meta["info"].get("fps"),
         "robot_type": meta["info"].get("robot_type"),
         "total_episodes": meta["info"].get("total_episodes"),
         "total_frames": meta["info"].get("total_frames"),
+        "kept_episodes": meta["info"].get("total_episodes", 0) - len(excluded),
+        "kept_frames": kept_frames,
+        "excluded": sorted(excluded),
         "video_keys": meta["video_keys"],
         "action_names": meta["info"]["features"].get("action", {}).get("names", []),
         "state_names": meta["info"]["features"].get("observation.state", {}).get("names", []),
         "episodes": [
-            {"episode_index": e["episode_index"], "length": e["length"], "task": e["task"]}
+            {
+                "episode_index": e["episode_index"],
+                "length": e["length"],
+                "task": e["task"],
+                "excluded": e["episode_index"] in excluded,
+            }
             for e in meta["episodes"]
         ],
+    })
+
+
+class ToggleExcludeRequest(BaseModel):
+    repo_id: str
+    episode_index: int
+    excluded: bool  # True = soft-delete (mark excluded). False = restore.
+
+
+@app.post("/api/viz/toggle_exclude")
+def viz_toggle_exclude(req: ToggleExcludeRequest):
+    """Toggle the soft-delete flag on an episode. Instant + reversible.
+
+    Nothing on disk moves — the episode is just flagged in
+    meta/webapp_excluded.json so the UI can show it struck-through and
+    the next Compact & Push will actually delete it.
+    """
+    root = _viz_resolve_repo(req.repo_id)
+    meta = _viz_load_meta(req.repo_id)
+    total = meta["info"].get("total_episodes", 0)
+    if req.episode_index < 0 or req.episode_index >= total:
+        raise HTTPException(400, f"invalid episode index {req.episode_index}")
+    excluded = _viz_load_excluded(root)
+    if req.excluded:
+        excluded.add(req.episode_index)
+    else:
+        excluded.discard(req.episode_index)
+    _viz_save_excluded(root, excluded)
+    return JSONResponse({
+        "ok": True,
+        "excluded": sorted(excluded),
+        "kept_episodes": total - len(excluded),
     })
 
 @app.get("/api/viz/episode/{episode_index}")
@@ -816,6 +885,102 @@ class DeleteEpisodesRequest(BaseModel):
 
 class PushRequest(BaseModel):
     repo_id: str
+
+
+class CompactRequest(BaseModel):
+    repo_id: str
+    push: bool = True  # also mirror to HF after compacting
+
+
+@app.post("/api/viz/compact")
+def viz_compact(req: CompactRequest):
+    """Apply all excluded-episode flags as a single atomic dataset rewrite,
+    clear the manifest, and optionally push to HF. This is the ONLY action
+    that causes irreversible changes to the local dataset or the remote.
+    """
+    import shutil
+    from lerobot.datasets.dataset_tools import delete_episodes
+    from huggingface_hub import HfApi
+
+    root = _viz_resolve_repo(req.repo_id)
+    excluded = sorted(_viz_load_excluded(root))
+
+    ds = LeRobotDataset(req.repo_id, root=root)
+    total_before = ds.meta.total_episodes
+
+    result = {
+        "ok": True,
+        "excluded": excluded,
+        "removed_count": 0,
+        "kept_episodes": total_before,
+        "kept_frames": ds.meta.total_frames,
+        "pushed": False,
+        "hub_url": None,
+    }
+
+    # 1) Apply exclusions (only if any)
+    if excluded:
+        if len(excluded) >= total_before:
+            raise HTTPException(400, "cannot compact: all episodes are excluded")
+        tmp_repo = f"{req.repo_id}__tmp_compact_{int(time.time())}"
+        tmp_root = HF_LEROBOT_HOME / tmp_repo
+        try:
+            delete_episodes(
+                dataset=ds,
+                episode_indices=excluded,
+                output_dir=tmp_root,
+                repo_id=req.repo_id,
+            )
+        except Exception as exc:
+            shutil.rmtree(tmp_root, ignore_errors=True)
+            log.exception("compact: delete_episodes failed")
+            raise HTTPException(500, f"compact failed: {exc}")
+
+        backup = root.with_suffix(root.suffix + f".bak_{int(time.time())}")
+        try:
+            root.rename(backup)
+            tmp_root.rename(root)
+        except Exception as exc:
+            if backup.exists() and not root.exists():
+                backup.rename(root)
+            shutil.rmtree(tmp_root, ignore_errors=True)
+            raise HTTPException(500, f"compact swap failed: {exc}")
+        shutil.rmtree(backup, ignore_errors=True)
+
+        # manifest is now stale (indices re-numbered anyway); reset it
+        _viz_save_excluded(root, set())
+        _VIZ_META_CACHE.pop(req.repo_id, None)
+
+        ds = LeRobotDataset(req.repo_id, root=root)
+        result["removed_count"] = len(excluded)
+        result["kept_episodes"] = ds.meta.total_episodes
+        result["kept_frames"] = ds.meta.total_frames
+
+    # 2) Push (mirror)
+    if req.push:
+        try:
+            api = HfApi()
+            api.create_repo(repo_id=req.repo_id, repo_type="dataset", exist_ok=True)
+            # Don't push the webapp manifest; everything else mirrors.
+            api.upload_folder(
+                repo_id=req.repo_id,
+                folder_path=str(root),
+                repo_type="dataset",
+                ignore_patterns=["images/", "meta/webapp_excluded.json"],
+                delete_patterns=["*"],
+                commit_message=(
+                    f"Compact: removed {result['removed_count']} episode(s) → "
+                    f"{result['kept_episodes']} eps / {result['kept_frames']} frames"
+                ),
+            )
+            result["pushed"] = True
+            result["hub_url"] = f"https://huggingface.co/datasets/{req.repo_id}"
+        except Exception as exc:
+            log.exception("compact: push failed")
+            # Partial success: local compact happened, remote push did not.
+            raise HTTPException(500, f"compact succeeded locally but push failed: {exc}")
+
+    return JSONResponse(result)
 
 
 @app.post("/api/viz/push_to_hub")

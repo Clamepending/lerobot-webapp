@@ -117,7 +117,23 @@
     border-color: #3d1214;
     color: var(--red);
   }
-  .ep-item.deleting { opacity: 0.4; pointer-events: none; }
+  /* Excluded (soft-deleted) episodes */
+  .ep-item.excluded .num,
+  .ep-item.excluded .task,
+  .ep-item.excluded .len {
+    color: var(--muted-2);
+    text-decoration: line-through;
+  }
+  .ep-item.excluded {
+    background: rgba(255, 77, 79, 0.04);
+  }
+  .ep-item.excluded .del {
+    color: var(--red);
+  }
+  body.edit-mode .ep-item.excluded .del::before { content: "↻"; }
+  body.edit-mode .ep-item:not(.excluded) .del::before { content: "×"; }
+  .ep-item .del { font-size: 14px; }
+  .ep-item.pending { opacity: 0.5; pointer-events: none; }
 
   /* Edit-mode chrome */
   .edit-toggle {
@@ -319,14 +335,14 @@
   <button class="edit-toggle" id="edit-toggle" title="Toggle edit mode (E)">
     <span id="edit-toggle-label">Edit</span>
   </button>
-  <button class="edit-toggle" id="push-btn" title="Push local dataset back to HF">
-    <span id="push-btn-label">Push to HF</span>
+  <button class="edit-toggle" id="compact-btn" title="Apply exclusions and push to HF" disabled>
+    <span id="compact-btn-label">Compact & Push</span>
   </button>
   <a href="/">Recorder →</a>
   <a id="hf-link" href="#" target="_blank">HuggingFace ↗</a>
 </header>
 <div class="edit-banner" id="edit-banner">
-  Edit mode — delete episodes to remove them from the dataset. Changes are irreversible.
+  <span id="edit-banner-msg">Edit mode — click × to mark an episode for deletion. Marked episodes stay until you Compact &amp; Push.</span>
 </div>
 
 <main>
@@ -394,22 +410,67 @@
     const r = await fetch(`/api/viz/info?repo_id=${encodeURIComponent(REPO_ID)}`);
     if (!r.ok) throw new Error(await r.text());
     datasetInfo = await r.json();
-    epListTitle.textContent = `Episodes · ${datasetInfo.total_episodes}`;
+    renderSidebarHeader();
     renderEpisodeList(datasetInfo.episodes);
-    if (datasetInfo.episodes.length) loadEpisode(datasetInfo.episodes[0].episode_index);
+    updateCompactButton();
+    if (datasetInfo.episodes.length && !currentEpisode) {
+      // Default: focus first non-excluded episode
+      const first = datasetInfo.episodes.find(e => !e.excluded) || datasetInfo.episodes[0];
+      loadEpisode(first.episode_index);
+    }
+  }
+
+  function renderSidebarHeader() {
+    const kept = datasetInfo.kept_episodes;
+    const total = datasetInfo.total_episodes;
+    const pending = total - kept;
+    const keptFrames = datasetInfo.kept_frames;
+    const pendingFrames = datasetInfo.total_frames - keptFrames;
+    let html = `Episodes · <strong>${kept}</strong>`;
+    if (pending > 0) {
+      html += ` <span style="color:var(--red)">· −${pending} pending</span>`;
+    }
+    epListTitle.innerHTML = html;
+    epListTitle.style.textTransform = 'none';
+    epListTitle.style.fontSize = '12px';
+    // Also update edit banner with live counts
+    const bannerMsg = qs('#edit-banner-msg');
+    if (bannerMsg) {
+      if (pending > 0) {
+        bannerMsg.innerHTML =
+          `${pending} episode${pending === 1 ? '' : 's'} · ${pendingFrames.toLocaleString()} frames marked for deletion. ` +
+          `Click <strong>Compact &amp; Push</strong> to apply and sync to HF.`;
+      } else {
+        bannerMsg.textContent = 'Edit mode — click × to mark an episode for deletion. Marked episodes stay until you Compact & Push.';
+      }
+    }
+  }
+
+  function updateCompactButton() {
+    const btn = qs('#compact-btn');
+    const label = qs('#compact-btn-label');
+    const pending = datasetInfo.total_episodes - datasetInfo.kept_episodes;
+    if (pending > 0) {
+      btn.disabled = false;
+      label.textContent = `Compact & Push (−${pending})`;
+    } else {
+      btn.disabled = false;
+      label.textContent = 'Push to HF';
+    }
   }
 
   function renderEpisodeList(eps) {
     epList.innerHTML = '';
     for (const e of eps) {
       const row = document.createElement('div');
-      row.className = 'ep-item';
+      row.className = 'ep-item' + (e.excluded ? ' excluded' : '');
       row.dataset.ep = e.episode_index;
+      const delTitle = e.excluded ? 'Restore episode' : 'Mark for deletion';
       row.innerHTML = `
         <span class="num">#${String(e.episode_index).padStart(2,'0')}</span>
         <span class="task">${e.task}</span>
         <span class="len">${e.length}</span>
-        <button class="del" title="Delete episode" aria-label="Delete episode">×</button>
+        <button class="del" title="${delTitle}" aria-label="${delTitle}"></button>
       `;
       row.addEventListener('click', (ev) => {
         if (ev.target.classList.contains('del')) return;
@@ -417,25 +478,40 @@
       });
       row.querySelector('.del').addEventListener('click', async (ev) => {
         ev.stopPropagation();
-        row.classList.add('deleting');
+        row.classList.add('pending');
         try {
-          const r = await fetch('/api/viz/delete_episodes', {
+          const r = await fetch('/api/viz/toggle_exclude', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({repo_id: REPO_ID, episode_indices: [e.episode_index]}),
+            body: JSON.stringify({
+              repo_id: REPO_ID,
+              episode_index: e.episode_index,
+              excluded: !e.excluded,
+            }),
           });
           if (!r.ok) {
             const t = await r.text();
             let msg = t; try { msg = JSON.parse(t).detail || t; } catch(_){}
-            alert('Delete failed: ' + msg);
-            row.classList.remove('deleting');
+            alert('Toggle failed: ' + msg);
+            row.classList.remove('pending');
             return;
           }
-          // Reload info; episodes have been re-indexed.
-          await loadInfo();
+          const j = await r.json();
+          // Optimistically update local state (no full reload — instant feel)
+          e.excluded = !e.excluded;
+          datasetInfo.kept_episodes = j.kept_episodes;
+          // Recompute kept_frames from client state
+          datasetInfo.kept_frames = datasetInfo.episodes
+            .filter(ep => !ep.excluded).reduce((s, ep) => s + ep.length, 0);
+          datasetInfo.excluded = j.excluded;
+          row.classList.toggle('excluded', e.excluded);
+          row.querySelector('.del').title = e.excluded ? 'Restore episode' : 'Mark for deletion';
+          row.classList.remove('pending');
+          renderSidebarHeader();
+          updateCompactButton();
         } catch (err) {
-          alert('Delete failed: ' + err.message);
-          row.classList.remove('deleting');
+          alert('Toggle failed: ' + err.message);
+          row.classList.remove('pending');
         }
       });
       epList.appendChild(row);
@@ -736,32 +812,39 @@
     stage.innerHTML = `<div class="empty">Promise rejection: ${e.reason && e.reason.message || e.reason}</div>`;
   });
 
-  // Push-to-HF button
-  const pushBtn = qs('#push-btn');
-  const pushBtnLabel = qs('#push-btn-label');
-  pushBtn.addEventListener('click', async () => {
-    if (!confirm(`Push local dataset to https://huggingface.co/datasets/${REPO_ID}?\nThis will overwrite the remote dataset with your current local state.`)) return;
-    pushBtn.disabled = true;
-    pushBtnLabel.textContent = 'Pushing…';
+  // Compact & Push button — the only irreversible action
+  const compactBtn = qs('#compact-btn');
+  const compactLabel = qs('#compact-btn-label');
+  compactBtn.addEventListener('click', async () => {
+    const pending = datasetInfo.total_episodes - datasetInfo.kept_episodes;
+    const msg = pending > 0
+      ? `Delete ${pending} marked episode${pending === 1 ? '' : 's'} and push to HF?\nThis rewrites the local dataset and overwrites the remote.`
+      : `Push local dataset to HF?\nNo episodes are marked for deletion — this will just sync the current state.`;
+    if (!confirm(msg)) return;
+    compactBtn.disabled = true;
+    compactLabel.textContent = pending > 0 ? 'Compacting…' : 'Pushing…';
     try {
-      const r = await fetch('/api/viz/push_to_hub', {
+      const r = await fetch('/api/viz/compact', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({repo_id: REPO_ID}),
+        body: JSON.stringify({repo_id: REPO_ID, push: true}),
       });
       const t = await r.text();
       let j = {};
       try { j = JSON.parse(t); } catch(_) {}
       if (!r.ok) {
-        alert('Push failed: ' + (j.detail || t));
+        alert('Compact failed: ' + (j.detail || t));
         return;
       }
-      pushBtnLabel.textContent = 'Pushed ✓';
-      setTimeout(() => { pushBtnLabel.textContent = 'Push to HF'; }, 3000);
+      compactLabel.textContent = 'Pushed ✓';
+      // Clear current episode selection since indices re-numbered
+      currentEpisode = null;
+      await loadInfo();
+      setTimeout(() => { updateCompactButton(); }, 2500);
     } catch (err) {
-      alert('Push failed: ' + err.message);
+      alert('Compact failed: ' + err.message);
     } finally {
-      pushBtn.disabled = false;
+      compactBtn.disabled = false;
     }
   });
 
