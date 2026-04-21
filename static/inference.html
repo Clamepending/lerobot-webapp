@@ -157,6 +157,41 @@
   button.btn.primary:hover:not(:disabled) { filter: brightness(1.08); }
   button.btn.danger { color: var(--red); border-color: #3d1214; background: #1a0607; }
 
+  /* Always-visible E-stop when inference is running */
+  .estop-bar {
+    display: none;
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    padding: 12px 20px;
+    background: #1a0607;
+    border-bottom: 2px solid var(--red);
+  }
+  body.running .estop-bar { display: flex; align-items: center; gap: 14px; }
+  .estop-btn {
+    padding: 14px 28px;
+    background: var(--red); color: #0a0a0b;
+    border: 0; border-radius: 10px;
+    font-size: 16px; font-weight: 800;
+    letter-spacing: 0.12em; text-transform: uppercase;
+    cursor: pointer;
+    font-family: inherit;
+    box-shadow: 0 0 0 0 rgba(255,77,79,0.6);
+    animation: estop-pulse 1.5s infinite;
+  }
+  .estop-btn:hover { filter: brightness(1.1); }
+  @keyframes estop-pulse {
+    0% { box-shadow: 0 0 0 0 rgba(255,77,79,0.7); }
+    70% { box-shadow: 0 0 0 12px rgba(255,77,79,0); }
+    100% { box-shadow: 0 0 0 0 rgba(255,77,79,0); }
+  }
+  .estop-hint { color: var(--red); font-size: 13px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+  .field.checkbox { flex-direction: row; align-items: center; gap: 8px; margin-bottom: 12px; }
+  .field.checkbox input { width: 16px; height: 16px; accent-color: var(--purple); }
+  .field.checkbox label { font-size: 13px; color: var(--text); text-transform: none; letter-spacing: 0; }
+  .remote-hint { font-size: 11px; color: var(--muted); margin: -4px 0 8px 24px; line-height: 1.4; }
+
   .stat { display: flex; justify-content: space-between; font-size: 13px; }
   .stat .k { color: var(--muted); }
   .stat .v { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--text); }
@@ -170,6 +205,11 @@
   <a href="/">Recorder →</a>
   <a href="/viz">Viz →</a>
 </header>
+
+<div class="estop-bar" id="estop-bar">
+  <button class="estop-btn" id="estop-btn">✋ E-STOP</button>
+  <span class="estop-hint">Press <kbd>Esc</kbd> or click to cut inference + tear down pod</span>
+</div>
 
 <main>
   <section class="stage">
@@ -207,12 +247,21 @@
         <input id="duration_s" type="number" min="5" value="60" />
       </div>
       <div class="field">
-        <label for="device">Device</label>
+        <label for="device">Device (local only)</label>
         <select id="device">
           <option value="cpu" selected>cpu (Pi 5, ~2-5 Hz)</option>
           <option value="cuda">cuda (if GPU)</option>
           <option value="mps">mps (Apple silicon)</option>
         </select>
+      </div>
+      <div class="field checkbox">
+        <input id="remote" type="checkbox" />
+        <label for="remote">Run on remote GPU (RunPod)</label>
+      </div>
+      <div class="remote-hint" id="remote-hint" style="display:none">
+        Spins up a RTX 4090 pod (~$0.69/hr, billed while running). Uses lerobot's
+        async_inference (chunked actions so latency doesn't gate control rate).
+        Stopping tears down the pod.
       </div>
     </div>
     <div>
@@ -257,6 +306,7 @@
     const running = s.phase === "infer_loading" || s.phase === "infer_running";
     $("btn-start").disabled = running;
     $("btn-stop").disabled = !running;
+    document.body.classList.toggle('running', running);
 
     // Steps + progress
     $("step-counter").innerHTML = `<strong>${s.total_frames.toLocaleString()}</strong> steps`;
@@ -310,6 +360,9 @@
       duration_s: parseFloat($("duration_s").value),
       device: $("device").value,
       fps: 30,
+      remote: $("remote").checked,
+      actions_per_chunk: 50,
+      chunk_size_threshold: 0.5,
     };
     try {
       const r = await fetch("/api/inference/start", {
@@ -325,8 +378,18 @@
     } catch (err) { alert("Request failed: " + err); }
   });
 
-  $("btn-stop").addEventListener("click", async () => {
+  async function doStop() {
     await fetch("/api/inference/stop", {method: "POST"});
+  }
+  $("btn-stop").addEventListener("click", doStop);
+  $("estop-btn").addEventListener("click", doStop);
+  // Esc triggers E-stop from anywhere on the page, even focused in an input
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") { e.preventDefault(); doStop(); }
+  });
+  // Show/hide the remote cost hint
+  $("remote").addEventListener("change", (e) => {
+    $("remote-hint").style.display = e.target.checked ? "" : "none";
   });
 
   // Initial state + SSE
