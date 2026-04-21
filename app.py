@@ -644,16 +644,15 @@ class Controller:
             install_cmd = r"""
 mkdir -p /workspace/logs
 cat > /workspace/install.sh <<'EOS'
-set -uxo pipefail
 cd /workspace
 export PATH=$HOME/.local/bin:$PATH
 if ! command -v uv >/dev/null 2>&1; then curl -LsSf https://astral.sh/uv/install.sh | sh; fi
 if [ ! -d lerobot ]; then git clone --depth 1 https://github.com/huggingface/lerobot lerobot; fi
 cd lerobot
 if [ ! -d .venv ]; then uv venv --python 3.12 .venv; fi
-source .venv/bin/activate
-uv pip install -e '.[async]' 2>&1 | tail -20
-uv pip uninstall torchcodec 2>/dev/null || true
+VENV=/workspace/lerobot/.venv
+uv pip install --python $VENV/bin/python -e '.[async]' 2>&1
+uv pip uninstall --python $VENV/bin/python torchcodec 2>/dev/null || true
 HF_TOKEN=$(tr '\0' '\n' < /proc/1/environ | grep '^HF_TOKEN=' | cut -d= -f2-)
 mkdir -p ~/.cache/huggingface
 echo -n "$HF_TOKEN" > ~/.cache/huggingface/token
@@ -669,38 +668,56 @@ echo INSTALL_STARTED
             if "INSTALL_STARTED" not in (r.stdout + r.stderr):
                 raise RuntimeError(f"install kickoff failed: {(r.stdout + r.stderr)[-400:]}")
 
-            # 4) poll for install completion
+            # 4) poll for install completion — prefer last non-trace line + %progress if any
             deadline = time.time() + 900  # 15 min max
             last_msg = ""
+            poll_cmd = (
+                "test -f /workspace/logs/install.done && echo DONE || "
+                # strip bash -x trace lines (start with '+') and pick the last useful line
+                "grep -vE '^\\+' /workspace/logs/install.log 2>/dev/null | tail -1"
+            )
+            installed = False
             while time.time() < deadline and not self.events["stop_recording"]:
-                r = subprocess.run(
-                    ssh_base + ["test -f /workspace/logs/install.done && echo OK || tail -1 /workspace/logs/install.log 2>/dev/null"],
-                    capture_output=True, text=True, timeout=30,
-                )
-                if "OK" in r.stdout:
+                r = subprocess.run(ssh_base + [poll_cmd], capture_output=True, text=True, timeout=30)
+                if "DONE" in r.stdout:
+                    installed = True
                     break
-                msg = r.stdout.strip()[:120]
+                msg = r.stdout.strip().replace("\n", " ")[:140]
                 if msg and msg != last_msg:
                     self._update(message=f"Installing: {msg}")
                     last_msg = msg
                 time.sleep(10)
-            else:
+            if not installed:
                 raise RuntimeError("install timed out (>15 min)")
             if self.events["stop_recording"]:
                 raise RuntimeError("cancelled during install")
 
-            # 5) start policy_server on the pod
+            # 5) start policy_server on the pod — use absolute python path, capture PID,
+            #    verify the process is actually alive after 5s (so we catch instant crashes)
             self._update(message="Starting policy_server on pod…")
-            start_srv = (
-                "cd /workspace/lerobot && source .venv/bin/activate && "
-                "rm -f /workspace/logs/server.log; "
-                "nohup python -m lerobot.async_inference.policy_server "
-                "--host=0.0.0.0 --port=8080 > /workspace/logs/server.log 2>&1 < /dev/null & "
-                "disown; sleep 2; echo SERVER_STARTED"
-            )
+            start_srv = r"""
+VENV=/workspace/lerobot/.venv
+rm -f /workspace/logs/server.log /workspace/logs/server.pid
+cd /workspace/lerobot
+nohup $VENV/bin/python -m lerobot.async_inference.policy_server \
+  --host=0.0.0.0 --port=8080 \
+  > /workspace/logs/server.log 2>&1 < /dev/null &
+SRV_PID=$!
+disown
+echo $SRV_PID > /workspace/logs/server.pid
+sleep 6
+if kill -0 $SRV_PID 2>/dev/null; then
+  echo SERVER_OK pid=$SRV_PID
+else
+  echo SERVER_DIED
+  tail -40 /workspace/logs/server.log
+fi
+"""
             r = subprocess.run(ssh_base + [start_srv], capture_output=True, text=True, timeout=60)
-            if "SERVER_STARTED" not in (r.stdout + r.stderr):
-                raise RuntimeError(f"server start failed: {(r.stdout + r.stderr)[-400:]}")
+            out = (r.stdout + r.stderr)
+            if "SERVER_OK" not in out:
+                tail = out[-600:]
+                raise RuntimeError(f"policy_server didn't stay up. Tail: {tail}")
 
             # 6) resolve the public TCP mapping for port 8080
             self._update(message="Resolving public port mapping…")
