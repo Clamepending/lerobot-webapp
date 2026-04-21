@@ -177,7 +177,8 @@ class Controller:
         # Remote inference bookkeeping — set while a remote session is active
         self._remote_pod_id: Optional[str] = None
         self._remote_ssh: Optional[dict] = None          # {host, port}
-        self._remote_server_url: Optional[str] = None    # ip:mapped_port for gRPC
+        self._remote_server_url: Optional[str] = None    # localhost:PORT (SSH-tunneled)
+        self._remote_tunnel_proc = None                  # the ssh -L tunnel subprocess
         self._remote_policy_repo_id: Optional[str] = None
         self._remote_client_proc = None                  # subprocess.Popen of robot_client
         self._remote_spinup_thread: Optional[threading.Thread] = None
@@ -546,18 +547,21 @@ class Controller:
         with self._remote_lock:
             pod_id = self._remote_pod_id
             proc = self._remote_client_proc
+            tunnel = self._remote_tunnel_proc
             self._remote_pod_id = None
             self._remote_server_url = None
             self._remote_ssh = None
             self._remote_client_proc = None
+            self._remote_tunnel_proc = None
         self.events["stop_recording"] = True
         self.events["exit_early"] = True
-        if proc is not None and proc.poll() is None:
-            try:
-                proc.terminate()
-                try: proc.wait(timeout=3)
-                except Exception: proc.kill()
-            except Exception: pass
+        for p in (proc, tunnel):
+            if p is not None and p.poll() is None:
+                try:
+                    p.terminate()
+                    try: p.wait(timeout=3)
+                    except Exception: p.kill()
+                except Exception: pass
         self._update(phase=PHASE_REMOTE_TEARDOWN, message="Deleting pod…")
         if pod_id:
             self._delete_pod(pod_id)
@@ -593,7 +597,8 @@ class Controller:
                     "--container-disk-in-gb", "40",
                     "--volume-in-gb", "40",
                     "--cloud-type", cloud,
-                    "--ports", "22/tcp,8080/tcp",
+                    # Only SSH is needed publicly; we tunnel 8080 through ssh.
+                    "--ports", "22/tcp",
                     "--env", env_json,
                 ]
                 r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
@@ -719,43 +724,62 @@ fi
                 tail = out[-600:]
                 raise RuntimeError(f"policy_server didn't stay up. Tail: {tail}")
 
-            # 6) resolve the public TCP mapping for port 8080
-            self._update(message="Resolving public port mapping…")
-            mapped_port = None; public_ip = host
-            deadline = time.time() + 120
-            while time.time() < deadline and not self.events["stop_recording"]:
-                r = subprocess.run(
-                    ["runpodctl", "pod", "get", pod_id],
-                    capture_output=True, text=True, timeout=30,
-                )
-                try: d = _json.loads(r.stdout)
-                except Exception: d = {}
-                rt = d.get("runtime") or {}
-                for p in (rt.get("ports") or []):
-                    if p.get("privatePort") == 8080 and p.get("type") == "tcp":
-                        mapped_port = p.get("publicPort")
-                        public_ip = p.get("ip") or host
-                        break
-                if mapped_port:
+            # 6) open an SSH tunnel Pi:8080 → pod:8080 so robot_client can connect via localhost
+            self._update(message="Opening SSH tunnel for policy_server…")
+            tunnel_cmd = [
+                "ssh", "-i", ssh_key, "-p", str(ssh_port),
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "ServerAliveInterval=30",
+                "-o", "ExitOnForwardFailure=yes",
+                "-N",                           # no command
+                "-L", "8080:localhost:8080",    # forward local 8080 → pod 8080
+                f"root@{host}",
+            ]
+            tunnel = subprocess.Popen(
+                tunnel_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+            )
+            with self._remote_lock:
+                self._remote_tunnel_proc = tunnel
+            # Wait for tunnel to be usable: probe localhost:8080 with a TCP connect
+            import socket
+            ready = False
+            for _ in range(30):  # ~15s
+                if tunnel.poll() is not None:
+                    err = (tunnel.stderr.read() or b"").decode(errors="replace")[-300:]
+                    raise RuntimeError(f"ssh tunnel died: {err}")
+                try:
+                    s = socket.create_connection(("localhost", 8080), timeout=0.5)
+                    s.close()
+                    ready = True
                     break
-                time.sleep(5)
-            if not mapped_port:
-                raise RuntimeError("port 8080 never became publicly routable")
+                except OSError:
+                    time.sleep(0.5)
+            if not ready:
+                raise RuntimeError("ssh tunnel opened but localhost:8080 never became connectable")
 
-            server_url = f"{public_ip}:{mapped_port}"
+            server_url = "localhost:8080"
             with self._remote_lock:
                 self._remote_server_url = server_url
             self._update(
                 phase=PHASE_REMOTE_READY,
-                message=f"Ready — policy_server at {server_url}. Click Play to run the robot.",
+                message=f"Ready — policy_server on pod {pod_id} (tunneled). Click Play.",
             )
         except Exception as exc:
             log.exception("spinup failed")
-            # Best-effort teardown of any partial pod
+            # Best-effort teardown of any partial pod + tunnel
             with self._remote_lock:
                 pod_id = self._remote_pod_id
+                tunnel = self._remote_tunnel_proc
                 self._remote_pod_id = None
                 self._remote_server_url = None
+                self._remote_tunnel_proc = None
+            if tunnel is not None and tunnel.poll() is None:
+                try:
+                    tunnel.terminate()
+                    try: tunnel.wait(timeout=3)
+                    except Exception: tunnel.kill()
+                except Exception: pass
             if pod_id:
                 self._delete_pod(pod_id)
             self._update(phase=PHASE_ERROR, error=str(exc), message=f"Spinup failed: {exc}")
