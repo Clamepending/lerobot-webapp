@@ -89,6 +89,8 @@ PHASE_SAVING = "saving"
 PHASE_UPLOADING = "uploading"
 PHASE_DONE = "done"
 PHASE_ERROR = "error"
+PHASE_INFER_LOADING = "infer_loading"
+PHASE_INFER_RUNNING = "infer_running"
 
 
 class SessionRequest(BaseModel):
@@ -104,6 +106,14 @@ class SessionRequest(BaseModel):
 
 class CommandRequest(BaseModel):
     command: str  # advance | re_record | abort | start
+
+
+class InferenceRequest(BaseModel):
+    policy_repo_id: str
+    task: str = "move pingu to coaster"
+    duration_s: float = 60.0
+    fps: int = 30
+    device: str = "cpu"  # "cpu" on Pi; no GPU available
 
 
 @dataclass
@@ -321,6 +331,162 @@ class Controller:
         )
         self.worker = threading.Thread(target=self._run_session, args=(req,), daemon=True)
         self.worker.start()
+
+    def start_inference(self, req: InferenceRequest):
+        if self.is_session_active():
+            raise HTTPException(409, "a session is already running")
+        missing_cams = [f"{n}={p}" for n, p in CAMERAS.items() if not Path(p).exists()]
+        if missing_cams:
+            raise HTTPException(400, "Cameras not present: " + ", ".join(missing_cams))
+        self.events.update(stop_recording=False, exit_early=False)
+        self._update(
+            phase=PHASE_INFER_LOADING,
+            repo_id=req.policy_repo_id,  # reuse field for policy
+            task=req.task,
+            num_episodes=0,
+            episodes_recorded=0,
+            current_episode=0,
+            phase_started_at=0.0,
+            phase_total_s=req.duration_s,
+            fps=req.fps,
+            total_frames=0,
+            error=None,
+            message=f"Loading policy {req.policy_repo_id}…",
+            hub_url=f"https://huggingface.co/{req.policy_repo_id}",
+        )
+        self.worker = threading.Thread(
+            target=self._run_inference, args=(req,), daemon=True, name="inference"
+        )
+        self.worker.start()
+
+    def stop_inference(self):
+        self.events["stop_recording"] = True
+        self.events["exit_early"] = True
+
+    def _run_inference(self, req: InferenceRequest):
+        self.stop_preview()
+        try:
+            self._inference_body(req)
+        except Exception as exc:
+            log.exception("inference failed")
+            self._update(phase=PHASE_ERROR, error=str(exc), message=f"Error: {exc}")
+        finally:
+            self.start_preview()
+
+    def _inference_body(self, req: InferenceRequest):
+        import torch
+        from lerobot.configs.policies import PreTrainedConfig
+        from lerobot.policies.factory import make_policy, make_pre_post_processors
+        from lerobot.utils.control_utils import predict_action
+
+        # Load policy config from the HF repo
+        policy_cfg = PreTrainedConfig.from_pretrained(req.policy_repo_id)
+        policy_cfg.device = req.device
+        policy_cfg.pretrained_path = req.policy_repo_id
+
+        # Build the robot (same follower + cameras we use for recording, no teleop)
+        robot_config = SOFollowerRobotConfig(
+            port=FOLLOWER_PORT,
+            id=FOLLOWER_ID,
+            cameras={
+                name: OpenCVCameraConfig(
+                    index_or_path=Path(path),
+                    fps=CAM_FPS, width=CAM_WIDTH, height=CAM_HEIGHT,
+                )
+                for name, path in CAMERAS.items()
+            },
+        )
+        robot = make_robot_from_config(robot_config)
+
+        # Policy needs dataset meta (for feature shapes / stats) — we reuse the dataset
+        # this policy was trained on. Find it from the training config.
+        ds_repo = None
+        try:
+            from huggingface_hub import hf_hub_download
+            import json as _json
+            tc = hf_hub_download(req.policy_repo_id, "train_config.json", repo_type="model")
+            ds_repo = _json.loads(Path(tc).read_text()).get("dataset", {}).get("repo_id")
+        except Exception:
+            pass
+        if not ds_repo:
+            raise RuntimeError("cannot determine training dataset from policy repo — provide manually")
+
+        ds = LeRobotDataset(ds_repo)
+        policy = make_policy(policy_cfg, ds_meta=ds.meta)
+        preprocessor, postprocessor = make_pre_post_processors(
+            policy_cfg=policy_cfg,
+            pretrained_path=req.policy_repo_id,
+            dataset_stats=ds.meta.stats,
+            preprocessor_overrides={"device_processor": {"device": req.device}},
+        )
+        policy.eval()
+        policy.reset()
+
+        self._update(message=f"Connecting robot… ({len(robot_config.cameras)} cams)")
+        robot.connect()
+        self._update(
+            cameras=list(robot.cameras.keys()),
+            phase=PHASE_INFER_RUNNING,
+            phase_started_at=time.time(),
+            message=f"Running policy {req.policy_repo_id}",
+        )
+
+        device = torch.device(req.device)
+        fps = req.fps
+        start = time.perf_counter()
+        timestamp = 0.0
+        steps = 0
+        last_ui_update = 0.0
+        try:
+            while timestamp < req.duration_s and not self.events["stop_recording"]:
+                loop_start = time.perf_counter()
+                obs = robot.get_observation()
+                # Publish frames so MJPEG stays live
+                for cam_name in robot.cameras:
+                    frame = obs.get(cam_name)
+                    if frame is None:
+                        frame = obs.get(f"{OBS_STR}.images.{cam_name}")
+                    if isinstance(frame, np.ndarray):
+                        self._publish_frame(cam_name, frame)
+
+                action_values = predict_action(
+                    observation=obs,
+                    policy=policy,
+                    device=device,
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                    use_amp=False,
+                    task=req.task,
+                    robot_type=robot.name,
+                )
+                robot_action = {
+                    k: action_values[i].item()
+                    for i, k in enumerate(robot.action_features)
+                }
+                robot.send_action(robot_action)
+
+                steps += 1
+                now = time.perf_counter()
+                if now - last_ui_update > 0.25:
+                    with self.cond:
+                        self.state.total_frames = steps
+                        self.version += 1
+                        self.cond.notify_all()
+                    last_ui_update = now
+
+                dt = time.perf_counter() - loop_start
+                precise_sleep(max(1 / fps - dt, 0.0))
+                timestamp = time.perf_counter() - start
+        finally:
+            with contextlib.suppress(Exception):
+                if robot.is_connected:
+                    robot.disconnect()
+
+        self._update(
+            phase=PHASE_DONE,
+            total_frames=steps,
+            message=f"Inference done — {steps} steps in {timestamp:.1f}s",
+        )
 
     def command(self, cmd: str):
         if cmd == "start":
@@ -674,6 +840,23 @@ def api_start(req: SessionRequest):
 @app.post("/api/session/command")
 def api_command(req: CommandRequest):
     controller.command(req.command)
+    return JSONResponse({"ok": True})
+
+
+@app.get("/inference")
+def inference_root():
+    return FileResponse(STATIC_DIR / "inference.html")
+
+
+@app.post("/api/inference/start")
+def api_inference_start(req: InferenceRequest):
+    controller.start_inference(req)
+    return JSONResponse(controller.snapshot())
+
+
+@app.post("/api/inference/stop")
+def api_inference_stop():
+    controller.stop_inference()
     return JSONResponse({"ok": True})
 
 
