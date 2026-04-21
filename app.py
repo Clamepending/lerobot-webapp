@@ -91,6 +91,11 @@ PHASE_DONE = "done"
 PHASE_ERROR = "error"
 PHASE_INFER_LOADING = "infer_loading"
 PHASE_INFER_RUNNING = "infer_running"
+# Remote inference 3-stage state machine:
+PHASE_REMOTE_SPINUP = "remote_spinup"    # pod creating / installing / server starting
+PHASE_REMOTE_READY = "remote_ready"      # pod live, server listening, waiting for Play
+PHASE_REMOTE_PLAYING = "remote_playing"  # robot_client is running
+PHASE_REMOTE_TEARDOWN = "remote_teardown"  # deleting pod
 
 
 class SessionRequest(BaseModel):
@@ -171,7 +176,11 @@ class Controller:
 
         # Remote inference bookkeeping — set while a remote session is active
         self._remote_pod_id: Optional[str] = None
-        self._remote_client_proc = None  # subprocess.Popen
+        self._remote_ssh: Optional[dict] = None          # {host, port}
+        self._remote_server_url: Optional[str] = None    # ip:mapped_port for gRPC
+        self._remote_policy_repo_id: Optional[str] = None
+        self._remote_client_proc = None                  # subprocess.Popen of robot_client
+        self._remote_spinup_thread: Optional[threading.Thread] = None
         self._remote_lock = threading.Lock()
 
         # Preview manager: keeps cameras live outside of a recording session so the
@@ -399,182 +408,65 @@ class Controller:
             log.warning("pod delete failed (%s): %s", pod_id, exc)
 
     def _run_inference(self, req: InferenceRequest):
+        """Local-only inference. Remote uses the 3-stage spinup/play/teardown flow."""
         self.stop_preview()
         try:
-            if req.remote:
-                self._remote_inference_body(req)
-            else:
-                self._inference_body(req)
+            self._inference_body(req)
         except Exception as exc:
             log.exception("inference failed")
             self._update(phase=PHASE_ERROR, error=str(exc), message=f"Error: {exc}")
         finally:
-            # Always clean up remote state
-            with self._remote_lock:
-                pod_id = self._remote_pod_id
-                self._remote_pod_id = None
-                self._remote_client_proc = None
-            if pod_id:
-                self._delete_pod(pod_id)
             self.start_preview()
 
-    def _remote_inference_body(self, req: InferenceRequest):
-        """Launch a RunPod pod running policy_server, then run robot_client locally."""
-        import json as _json
-        import subprocess
-        import shlex
-
-        self._update(phase=PHASE_INFER_LOADING, message="Launching RunPod pod…")
-        hf_tok = Path("/home/jake/.cache/huggingface/token").read_text().strip()
-        env_json = _json.dumps({
-            "HF_TOKEN": hf_tok,
-            "HUGGING_FACE_HUB_TOKEN": hf_tok,
-            "POLICY_REPO_ID": req.policy_repo_id,
-            "POLICY_TYPE": "act",
-        })
-        # Create pod — try SECURE first, fall back to COMMUNITY
-        pod_id = None
-        pod_info = None
-        for cloud in ("SECURE", "COMMUNITY"):
-            cmd = [
-                "runpodctl", "pod", "create",
-                "--name", "lerobot-policy-server",
-                "--template-id", "runpod-torch-v240",
-                "--gpu-id", "NVIDIA GeForce RTX 4090",
-                "--container-disk-in-gb", "40",
-                "--volume-in-gb", "40",
-                "--cloud-type", cloud,
-                "--ports", "22/tcp,8080/tcp",
-                "--env", env_json,
-            ]
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-            try:
-                info = _json.loads(r.stdout)
-            except Exception:
-                info = {}
-            if "id" in info:
-                pod_id = info["id"]; pod_info = info; break
-        if not pod_id:
-            raise RuntimeError(f"pod create failed: {r.stdout[:400]}")
-
+    # -------- remote inference: 3-stage flow --------
+    def remote_spinup(self, req: InferenceRequest):
+        """Stage 1: create pod, install lerobot[async], start policy_server. Idempotent."""
         with self._remote_lock:
-            self._remote_pod_id = pod_id
-        self._update(message=f"Pod {pod_id} booting — ~1 min")
-
-        # Wait for SSH + get host:port
-        host, ssh_port, tcp_port_8080 = None, None, None
-        deadline = time.time() + 180
-        while time.time() < deadline and not self.events["stop_recording"]:
-            r = subprocess.run(
-                ["runpodctl", "pod", "get", pod_id],
-                capture_output=True, text=True, timeout=30,
-            )
-            try:
-                d = _json.loads(r.stdout)
-            except Exception:
-                d = {}
-            ssh = d.get("ssh", {})
-            if ssh.get("host") or ssh.get("ip"):
-                host = ssh.get("ip") or ssh.get("host")
-                ssh_port = ssh.get("port")
-            # public TCP for port 8080 is listed in the pod details — check each port
-            # runpod maps internal 8080 to some public port, visible via the API
-            # We'll grab it via `pod get` output
-            # Some pod metadata shapes differ; just try to run
-            if host and ssh_port:
-                break
-            time.sleep(5)
-        if self.events["stop_recording"]:
-            raise RuntimeError("stopped while waiting for pod")
-        if not (host and ssh_port):
-            raise RuntimeError("pod never became SSH-ready")
-
-        ssh_key = "/home/jake/.runpod/ssh/RunPod-Key-Go"
-        ssh_base = ["ssh", "-i", ssh_key, "-p", str(ssh_port),
-                    "-o", "StrictHostKeyChecking=no",
-                    "-o", "UserKnownHostsFile=/dev/null",
-                    f"root@{host}"]
-
-        self._update(message=f"Installing lerobot on pod ({host}:{ssh_port})…")
-        install_script = r"""
-set -uxo pipefail
-cd /workspace
-export PATH=$HOME/.local/bin:$PATH
-if ! command -v uv >/dev/null 2>&1; then curl -LsSf https://astral.sh/uv/install.sh | sh; fi
-if [ ! -d lerobot ]; then git clone --depth 1 https://github.com/huggingface/lerobot lerobot; fi
-cd lerobot
-if [ ! -d .venv ]; then uv venv --python 3.12 .venv; fi
-source .venv/bin/activate
-uv pip install -e '.[async]' 2>&1 | tail -3
-uv pip uninstall torchcodec 2>/dev/null || true
-HF_TOKEN=$(tr '\0' '\n' < /proc/1/environ | grep '^HF_TOKEN=' | cut -d= -f2-)
-mkdir -p ~/.cache/huggingface
-echo -n "$HF_TOKEN" > ~/.cache/huggingface/token
-echo INSTALL_OK
-"""
-        r = subprocess.run(ssh_base + [install_script], capture_output=True, text=True, timeout=900)
-        if "INSTALL_OK" not in (r.stdout + r.stderr):
-            raise RuntimeError(f"pod install failed: {(r.stdout + r.stderr)[-500:]}")
-
-        self._update(message="Starting policy_server on pod…")
-        start_server = (
-            "cd /workspace/lerobot && source .venv/bin/activate && "
-            "rm -f /workspace/srv.log && "
-            "nohup python -m lerobot.async_inference.policy_server "
-            "--host=0.0.0.0 --port=8080 > /workspace/srv.log 2>&1 < /dev/null & disown; "
-            "sleep 2; echo SERVER_PID=$!"
-        )
-        r = subprocess.run(ssh_base + [start_server], capture_output=True, text=True, timeout=60)
-        # The server needs the client to push policy config via gRPC handshake,
-        # so just listening is enough at this point.
-
-        # Expose TCP 8080 via runpodctl — get the mapped public port
-        self._update(message="Looking up public port mapping…")
-        mapped_port = None
-        deadline = time.time() + 60
-        while time.time() < deadline:
-            r = subprocess.run(["runpodctl", "pod", "get", pod_id],
-                               capture_output=True, text=True, timeout=30)
-            try:
-                d = _json.loads(r.stdout)
-            except Exception:
-                d = {}
-            # port mapping typically appears in d["runtime"]["ports"] once public IP is assigned
-            rt = d.get("runtime") or {}
-            for p in rt.get("ports", []) or []:
-                if p.get("privatePort") == 8080 and p.get("type") == "tcp":
-                    mapped_port = p.get("publicPort")
-                    ip = p.get("ip") or host
-                    break
-            if mapped_port:
-                break
-            time.sleep(5)
-        if not mapped_port:
-            raise RuntimeError("could not resolve public TCP port for policy server")
-
-        server_url = f"{ip}:{mapped_port}"
+            if self._remote_server_url:
+                return  # already spun up
+            if self._remote_spinup_thread and self._remote_spinup_thread.is_alive():
+                return  # in progress
+        self.events.update(stop_recording=False, exit_early=False)
+        self._remote_policy_repo_id = req.policy_repo_id
         self._update(
-            phase=PHASE_INFER_RUNNING,
-            phase_started_at=time.time(),
-            message=f"Remote policy_server at {server_url} — starting robot_client",
-            cameras=list(CAMERAS.keys()),
+            phase=PHASE_REMOTE_SPINUP,
+            repo_id=req.policy_repo_id,
+            task=req.task,
+            num_episodes=0, episodes_recorded=0, current_episode=0,
+            phase_started_at=time.time(), phase_total_s=0,
+            fps=req.fps, total_frames=0, error=None,
+            message="Spinning up remote GPU…",
+            hub_url=f"https://huggingface.co/{req.policy_repo_id}",
         )
+        self.stop_preview()  # free cameras in case play comes next
+        t = threading.Thread(
+            target=self._do_spinup, args=(req,), daemon=True, name="remote_spinup"
+        )
+        self._remote_spinup_thread = t
+        t.start()
 
-        # Launch robot_client locally as subprocess; it owns the robot + cameras.
+    def remote_play(self, req: InferenceRequest):
+        """Stage 2a: launch robot_client subprocess against the already-running server."""
+        with self._remote_lock:
+            if not self._remote_server_url:
+                raise HTTPException(400, "remote not spun up yet — click Spin Up first")
+            if self._remote_client_proc and self._remote_client_proc.poll() is None:
+                return  # already playing
+        import subprocess, shlex
         cams_arg = "{" + ", ".join(
-            f"{n}:{{type:opencv,index_or_path:{p},width:{CAM_WIDTH},height:{CAM_HEIGHT},fps:{CAM_FPS}}}"
+            f"{n}: {{type: opencv, index_or_path: {p}, width: {CAM_WIDTH}, height: {CAM_HEIGHT}, fps: {CAM_FPS}}}"
             for n, p in CAMERAS.items()
         ) + "}"
         client_cmd = [
             "/home/jake/lerobot/.venv/bin/python", "-m", "lerobot.async_inference.robot_client",
-            f"--server_address={server_url}",
+            f"--server_address={self._remote_server_url}",
             "--robot.type=so101_follower",
             f"--robot.port={FOLLOWER_PORT}",
             f"--robot.id={FOLLOWER_ID}",
             f"--robot.cameras={cams_arg}",
             f"--task={req.task}",
             "--policy_type=act",
-            f"--pretrained_name_or_path={req.policy_repo_id}",
+            f"--pretrained_name_or_path={self._remote_policy_repo_id}",
             "--policy_device=cuda",
             f"--actions_per_chunk={req.actions_per_chunk}",
             f"--chunk_size_threshold={req.chunk_size_threshold}",
@@ -583,32 +475,274 @@ echo INSTALL_OK
         log_path = Path("/tmp/robot_client.log")
         log_path.write_text("")
         proc = subprocess.Popen(
-            client_cmd, stdout=open(log_path, "w"), stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            client_cmd,
+            stdout=open(log_path, "w"), stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
         )
         with self._remote_lock:
             self._remote_client_proc = proc
+        self._update(
+            phase=PHASE_REMOTE_PLAYING,
+            phase_started_at=time.time(), phase_total_s=req.duration_s,
+            cameras=list(CAMERAS.keys()),
+            message=f"Robot client running against {self._remote_server_url}",
+        )
+        threading.Thread(
+            target=self._watch_client_proc, args=(proc, req, log_path),
+            daemon=True, name="client_watcher",
+        ).start()
 
+    def _watch_client_proc(self, proc, req: InferenceRequest, log_path: Path):
+        import subprocess
         start_t = time.time()
         while proc.poll() is None and not self.events["stop_recording"]:
             elapsed = time.time() - start_t
-            if req.duration_s > 0 and elapsed >= req.duration_s:
+            if req.duration_s and elapsed >= req.duration_s:
                 break
             with self.cond:
-                self.state.total_frames = int(elapsed * req.fps)  # rough
+                self.state.total_frames = int(elapsed * req.fps)
                 self.version += 1
                 self.cond.notify_all()
             time.sleep(0.5)
-
-        # Tear down client
         if proc.poll() is None:
-            proc.terminate()
-            try: proc.wait(timeout=5)
-            except Exception: proc.kill()
-        tail = log_path.read_text()[-800:] if log_path.exists() else ""
-        if proc.returncode not in (0, None):
-            self._update(phase=PHASE_ERROR, message=f"robot_client exited {proc.returncode}. Tail: {tail[-300:]}")
+            try:
+                proc.terminate()
+                try: proc.wait(timeout=5)
+                except Exception: proc.kill()
+            except Exception as exc:
+                log.warning("client terminate failed: %s", exc)
+        tail = log_path.read_text()[-400:] if log_path.exists() else ""
+        with self._remote_lock:
+            self._remote_client_proc = None
+        # Go back to "ready" (pod still alive) unless an error occurred
+        if proc.returncode not in (0, None, -15, 143):  # 15/-15 = SIGTERM (our stop)
+            self._update(
+                phase=PHASE_REMOTE_READY,
+                message=f"robot_client exited {proc.returncode}. Tail: {tail[-200:]}",
+            )
         else:
-            self._update(phase=PHASE_DONE, message=f"Remote inference done ({time.time()-start_t:.1f}s)")
+            self._update(
+                phase=PHASE_REMOTE_READY,
+                message=f"Stopped — pod still warm. Click Play to resume, Teardown to release.",
+            )
+
+    def remote_stop_play(self):
+        """Stage 2b (E-STOP): kill robot_client immediately. Pod stays warm."""
+        with self._remote_lock:
+            proc = self._remote_client_proc
+        self.events["stop_recording"] = True
+        self.events["exit_early"] = True
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                try: proc.wait(timeout=3)
+                except Exception: proc.kill()
+            except Exception as exc:
+                log.warning("stop_play terminate failed: %s", exc)
+        # _watch_client_proc will transition phase back to REMOTE_READY
+        self.events["stop_recording"] = False  # reset so next play can proceed
+
+    def remote_teardown(self):
+        """Stage 3: kill the pod and reset all remote state."""
+        with self._remote_lock:
+            pod_id = self._remote_pod_id
+            proc = self._remote_client_proc
+            self._remote_pod_id = None
+            self._remote_server_url = None
+            self._remote_ssh = None
+            self._remote_client_proc = None
+        self.events["stop_recording"] = True
+        self.events["exit_early"] = True
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+                try: proc.wait(timeout=3)
+                except Exception: proc.kill()
+            except Exception: pass
+        self._update(phase=PHASE_REMOTE_TEARDOWN, message="Deleting pod…")
+        if pod_id:
+            self._delete_pod(pod_id)
+        self.events["stop_recording"] = False
+        self.events["exit_early"] = False
+        self._update(phase=PHASE_DONE, message="Pod torn down.", cameras=[])
+        # Resume local preview so cameras are live again
+        self.start_preview()
+
+    def _do_spinup(self, req: InferenceRequest):
+        """Background thread body: create pod → install (detached, poll) → start server."""
+        import json as _json
+        import subprocess
+        try:
+            hf_tok = Path("/home/jake/.cache/huggingface/token").read_text().strip()
+            env_json = _json.dumps({
+                "HF_TOKEN": hf_tok,
+                "HUGGING_FACE_HUB_TOKEN": hf_tok,
+                "POLICY_REPO_ID": req.policy_repo_id,
+            })
+
+            # 1) create pod (try SECURE, then COMMUNITY)
+            pod_id = None
+            for cloud in ("SECURE", "COMMUNITY"):
+                if self.events["stop_recording"]:
+                    raise RuntimeError("cancelled")
+                self._update(message=f"Creating 4090 pod ({cloud})…")
+                cmd = [
+                    "runpodctl", "pod", "create",
+                    "--name", "lerobot-policy-server",
+                    "--template-id", "runpod-torch-v240",
+                    "--gpu-id", "NVIDIA GeForce RTX 4090",
+                    "--container-disk-in-gb", "40",
+                    "--volume-in-gb", "40",
+                    "--cloud-type", cloud,
+                    "--ports", "22/tcp,8080/tcp",
+                    "--env", env_json,
+                ]
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                try:
+                    info = _json.loads(r.stdout)
+                except Exception:
+                    info = {}
+                if "id" in info:
+                    pod_id = info["id"]; break
+            if not pod_id:
+                raise RuntimeError(f"pod create failed (both clouds): {r.stdout[:400]}")
+            with self._remote_lock:
+                self._remote_pod_id = pod_id
+            self._update(message=f"Pod {pod_id} booting — waiting for SSH…")
+
+            # 2) wait for SSH
+            host, ssh_port = None, None
+            deadline = time.time() + 240
+            while time.time() < deadline and not self.events["stop_recording"]:
+                r = subprocess.run(
+                    ["runpodctl", "pod", "get", pod_id],
+                    capture_output=True, text=True, timeout=30,
+                )
+                try: d = _json.loads(r.stdout)
+                except Exception: d = {}
+                ssh = d.get("ssh") or {}
+                if (ssh.get("ip") or ssh.get("host")) and ssh.get("port"):
+                    host = ssh.get("ip") or ssh.get("host")
+                    ssh_port = ssh["port"]
+                    break
+                time.sleep(5)
+            if not (host and ssh_port):
+                raise RuntimeError("pod never became SSH-ready")
+            with self._remote_lock:
+                self._remote_ssh = {"host": host, "port": ssh_port}
+
+            ssh_key = "/home/jake/.runpod/ssh/RunPod-Key-Go"
+            ssh_base = [
+                "ssh", "-i", ssh_key, "-p", str(ssh_port),
+                "-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "ServerAliveInterval=30",
+                f"root@{host}",
+            ]
+
+            # 3) kick off install DETACHED on the pod, then poll for completion
+            self._update(message="Installing lerobot on pod (detached)…")
+            install_cmd = r"""
+mkdir -p /workspace/logs
+cat > /workspace/install.sh <<'EOS'
+set -uxo pipefail
+cd /workspace
+export PATH=$HOME/.local/bin:$PATH
+if ! command -v uv >/dev/null 2>&1; then curl -LsSf https://astral.sh/uv/install.sh | sh; fi
+if [ ! -d lerobot ]; then git clone --depth 1 https://github.com/huggingface/lerobot lerobot; fi
+cd lerobot
+if [ ! -d .venv ]; then uv venv --python 3.12 .venv; fi
+source .venv/bin/activate
+uv pip install -e '.[async]' 2>&1 | tail -20
+uv pip uninstall torchcodec 2>/dev/null || true
+HF_TOKEN=$(tr '\0' '\n' < /proc/1/environ | grep '^HF_TOKEN=' | cut -d= -f2-)
+mkdir -p ~/.cache/huggingface
+echo -n "$HF_TOKEN" > ~/.cache/huggingface/token
+echo INSTALL_OK > /workspace/logs/install.done
+EOS
+chmod +x /workspace/install.sh
+rm -f /workspace/logs/install.done /workspace/logs/install.log
+nohup bash /workspace/install.sh > /workspace/logs/install.log 2>&1 < /dev/null &
+disown
+echo INSTALL_STARTED
+"""
+            r = subprocess.run(ssh_base + [install_cmd], capture_output=True, text=True, timeout=120)
+            if "INSTALL_STARTED" not in (r.stdout + r.stderr):
+                raise RuntimeError(f"install kickoff failed: {(r.stdout + r.stderr)[-400:]}")
+
+            # 4) poll for install completion
+            deadline = time.time() + 900  # 15 min max
+            last_msg = ""
+            while time.time() < deadline and not self.events["stop_recording"]:
+                r = subprocess.run(
+                    ssh_base + ["test -f /workspace/logs/install.done && echo OK || tail -1 /workspace/logs/install.log 2>/dev/null"],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if "OK" in r.stdout:
+                    break
+                msg = r.stdout.strip()[:120]
+                if msg and msg != last_msg:
+                    self._update(message=f"Installing: {msg}")
+                    last_msg = msg
+                time.sleep(10)
+            else:
+                raise RuntimeError("install timed out (>15 min)")
+            if self.events["stop_recording"]:
+                raise RuntimeError("cancelled during install")
+
+            # 5) start policy_server on the pod
+            self._update(message="Starting policy_server on pod…")
+            start_srv = (
+                "cd /workspace/lerobot && source .venv/bin/activate && "
+                "rm -f /workspace/logs/server.log; "
+                "nohup python -m lerobot.async_inference.policy_server "
+                "--host=0.0.0.0 --port=8080 > /workspace/logs/server.log 2>&1 < /dev/null & "
+                "disown; sleep 2; echo SERVER_STARTED"
+            )
+            r = subprocess.run(ssh_base + [start_srv], capture_output=True, text=True, timeout=60)
+            if "SERVER_STARTED" not in (r.stdout + r.stderr):
+                raise RuntimeError(f"server start failed: {(r.stdout + r.stderr)[-400:]}")
+
+            # 6) resolve the public TCP mapping for port 8080
+            self._update(message="Resolving public port mapping…")
+            mapped_port = None; public_ip = host
+            deadline = time.time() + 120
+            while time.time() < deadline and not self.events["stop_recording"]:
+                r = subprocess.run(
+                    ["runpodctl", "pod", "get", pod_id],
+                    capture_output=True, text=True, timeout=30,
+                )
+                try: d = _json.loads(r.stdout)
+                except Exception: d = {}
+                rt = d.get("runtime") or {}
+                for p in (rt.get("ports") or []):
+                    if p.get("privatePort") == 8080 and p.get("type") == "tcp":
+                        mapped_port = p.get("publicPort")
+                        public_ip = p.get("ip") or host
+                        break
+                if mapped_port:
+                    break
+                time.sleep(5)
+            if not mapped_port:
+                raise RuntimeError("port 8080 never became publicly routable")
+
+            server_url = f"{public_ip}:{mapped_port}"
+            with self._remote_lock:
+                self._remote_server_url = server_url
+            self._update(
+                phase=PHASE_REMOTE_READY,
+                message=f"Ready — policy_server at {server_url}. Click Play to run the robot.",
+            )
+        except Exception as exc:
+            log.exception("spinup failed")
+            # Best-effort teardown of any partial pod
+            with self._remote_lock:
+                pod_id = self._remote_pod_id
+                self._remote_pod_id = None
+                self._remote_server_url = None
+            if pod_id:
+                self._delete_pod(pod_id)
+            self._update(phase=PHASE_ERROR, error=str(exc), message=f"Spinup failed: {exc}")
+            self.start_preview()
 
     def _inference_body(self, req: InferenceRequest):
         import torch
@@ -1094,6 +1228,30 @@ def api_inference_start(req: InferenceRequest):
 @app.post("/api/inference/stop")
 def api_inference_stop():
     controller.stop_inference()
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/inference/remote/spinup")
+def api_remote_spinup(req: InferenceRequest):
+    controller.remote_spinup(req)
+    return JSONResponse(controller.snapshot())
+
+
+@app.post("/api/inference/remote/play")
+def api_remote_play(req: InferenceRequest):
+    controller.remote_play(req)
+    return JSONResponse(controller.snapshot())
+
+
+@app.post("/api/inference/remote/stop")
+def api_remote_stop():
+    controller.remote_stop_play()
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/inference/remote/teardown")
+def api_remote_teardown():
+    controller.remote_teardown()
     return JSONResponse({"ok": True})
 
 
