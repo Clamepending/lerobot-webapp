@@ -592,7 +592,8 @@ class Controller:
                 cmd = [
                     "runpodctl", "pod", "create",
                     "--name", "lerobot-policy-server",
-                    "--template-id", "runpod-torch-v240",
+                    # v280 ships python 3.12 + torch 2.8 preinstalled, huge install speedup
+                    "--template-id", "runpod-torch-v280",
                     "--gpu-id", "NVIDIA GeForce RTX 4090",
                     "--container-disk-in-gb", "40",
                     "--volume-in-gb", "40",
@@ -674,7 +675,7 @@ echo INSTALL_STARTED
                 raise RuntimeError(f"install kickoff failed: {(r.stdout + r.stderr)[-400:]}")
 
             # 4) poll for install completion — prefer last non-trace line + %progress if any
-            deadline = time.time() + 900  # 15 min max
+            deadline = time.time() + 1500  # 25 min max
             last_msg = ""
             poll_cmd = (
                 "test -f /workspace/logs/install.done && echo DONE || "
