@@ -1071,24 +1071,8 @@ fi
             if self.events["stop_recording"]:
                 break
 
-            # Optional RESET phase (skip on the very last episode)
-            is_last = dataset.num_episodes + 1 >= target_total
-            if not is_last and req.reset_time_s > 0:
-                self._update(
-                    phase=PHASE_RESET,
-                    phase_started_at=time.time(),
-                    phase_total_s=req.reset_time_s,
-                    message="Reset the environment",
-                )
-                self._run_loop(
-                    robot, teleop, dataset, teleop_ap, robot_ap, robot_op,
-                    control_time_s=req.reset_time_s,
-                    single_task=req.task,
-                    write_to_dataset=False,
-                )
-
-            if self.events["stop_recording"]:
-                break
+            # (Reset stage removed — scene reset happens in the next READY gate
+            # with live camera preview. Press Space when you're ready to record again.)
 
             # Save the episode we just recorded
             self._update(phase=PHASE_SAVING, message="Saving episode…")

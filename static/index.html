@@ -396,11 +396,8 @@
         <label for="episode_time_s">Seconds / episode</label>
         <input id="episode_time_s" name="episode_time_s" type="number" min="1" step="0.5" value="30" />
       </div>
-      <div>
-        <label for="reset_time_s">Reset seconds</label>
-        <input id="reset_time_s" name="reset_time_s" type="number" min="0" step="0.5" value="10" />
-      </div>
     </div>
+    <input id="reset_time_s" name="reset_time_s" type="hidden" value="0" />
     <div class="field checkbox">
       <input id="resume" name="resume" type="checkbox" />
       <label for="resume">Resume existing dataset (add episodes to the N already recorded — total = Episodes field)</label>
