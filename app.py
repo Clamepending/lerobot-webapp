@@ -624,9 +624,9 @@ class Controller:
                 self._remote_pod_id = pod_id
             self._update(message=f"Pod {pod_id} booting — waiting for SSH…")
 
-            # 2) wait for SSH
+            # 2) wait for SSH — v280 image is larger, can take up to 5 min to pull+boot
             host, ssh_port = None, None
-            deadline = time.time() + 240
+            deadline = time.time() + 420
             while time.time() < deadline and not self.events["stop_recording"]:
                 r = subprocess.run(
                     ["runpodctl", "pod", "get", pod_id],
