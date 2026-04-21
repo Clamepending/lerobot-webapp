@@ -477,8 +477,17 @@ class Controller:
         log_path.write_text("")
         proc = subprocess.Popen(
             client_cmd,
-            stdout=open(log_path, "w"), stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            stdout=open(log_path, "w"), stderr=subprocess.STDOUT,
+            stdin=subprocess.PIPE,
         )
+        # Feed a bunch of newlines so any input() prompts in robot.connect()
+        # (e.g. the "Press ENTER to accept stored calibration" prompt) are
+        # auto-accepted instead of hitting EOF and crashing.
+        try:
+            proc.stdin.write(b"\n\n\n")
+            proc.stdin.flush()
+        except Exception:
+            pass
         with self._remote_lock:
             self._remote_client_proc = proc
         self._update(
