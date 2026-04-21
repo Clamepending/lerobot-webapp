@@ -61,3 +61,17 @@ LEADER_ID=my_leader
 CAMERAS="wrist=/dev/video0,top=/dev/video2"
 CAM_WIDTH=640 CAM_HEIGHT=480 CAM_FPS=30
 ```
+
+**USB enumeration gotcha:** on a Pi 5 the two SO-ARM 101 arms can swap
+`/dev/ttyACMx` between reboots or cable replugs. If the wrong arm moves
+when you run inference, identify which is which by serial short ID:
+
+```bash
+udevadm info --query=all --name=/dev/ttyACM0 | grep ID_SERIAL_SHORT
+udevadm info --query=all --name=/dev/ttyACM1 | grep ID_SERIAL_SHORT
+```
+
+Then set `FOLLOWER_PORT` / `LEADER_PORT` accordingly. A proper fix is a
+udev rule binding each arm's serial to a stable symlink like
+`/dev/so101-follower`. Same pattern applies to the USB cameras on
+`/dev/video0/2`.
